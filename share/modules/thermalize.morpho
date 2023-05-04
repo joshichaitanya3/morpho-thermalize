@@ -235,7 +235,7 @@ class Thermalizer is ShapeOptimizer {
         self.L = problem.L
         self.velocity_scale_steps = 100 // Interval of steps to pass by before checking for velocity rescaling
         self.forces = self.totalforcewithconstraints()
-        var sel = self.getRegion(0, depth=1)
+        // var sel = self.getRegion(0, depth=1)
         // self.currentEnergy = self.totalenergywithLagrange(sel=sel)
         self.currentEnergy = self.totalenergywithLagrange()
     }
