@@ -1,4 +1,4 @@
-# morpho-vectorplot
+# morpho-thermalize
 
 Perform Monte-Carlo and molecular dynamics simulations in [Morpho](https://github.com/Morpho-lang/morpho). 
 
