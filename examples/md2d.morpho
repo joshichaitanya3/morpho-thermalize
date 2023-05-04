@@ -1,0 +1,46 @@
+import thermalize
+import pairwise 
+
+// System parameters
+var Np = 100 // Number of particles
+var density = 0.8
+var box_width = (Np / density)^(1 / 2)
+var cutoff = 2.5
+print "Box width: ${box_width}"
+
+// MD / Lennard Jones parameters
+var ref_temp = 0.85 // Reference temperature
+var eps = 1.0
+var sigma = 1.0
+var dt = 0.01
+
+var build = MeshBuilder()
+
+for (i in 1..Np) {
+    var x = box_width/2 * Matrix([2*random()-1, 2*random()-1, 2*random()-1])
+    build.addvertex(x)
+}
+var mesh = build.build() // Tell the MeshBuilder to build the mesh
+
+var mesh = AreaMesh(fn(u,v) [u,v,0], -0.45*box_width..0.45*box_width:0.1*box_width, -0.45*box_width..0.45*box_width:0.1*box_width)
+
+Np = mesh.count()
+print "# of particles: ${Np}" 
+
+var dim = mesh.vertexmatrix().dimensions() 
+var NDIMS = 2
+
+var tproblem = ThermalizationProblem(mesh, ref_temp, NDIMS)
+tproblem.L = box_width
+
+var ljp = LJPotential(sigma) 
+
+var lj = Pairwise(ljp, cutoff=cutoff, box=box_width)
+
+tproblem.addenergy(lj)
+
+var therm = Thermalizer(tproblem, mesh)
+therm.velocity_scale_steps = 50
+therm.dt = dt 
+
+therm.md(3000, filename="testMD2D")
