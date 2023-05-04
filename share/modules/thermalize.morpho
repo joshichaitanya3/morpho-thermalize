@@ -1,0 +1,643 @@
+/* An implementation of finite-temperature physics of shapes,
+built on the optimize module. 
+A ThermalizationProblem is inherited from the OptimizationProblem
+and a Thermalizer is inherited from the ShapeOptimizer.
+
+The Thermalizer is able to perform 
+
+(a) Monte Carlo sweeps: A single Monte Carlo step perturbs a vertex of the mesh
+by a random amount in the cube of [-s,s] prescribed by the user. Each perturbation is 
+either accepted or rejected with a probability min(1, exp(-(Ef-Ei)/KbT). This means that 
+moves that reduce the energy are always accepted, whereas moves that increase the energy 
+are accepted with a Boltzmann probability. A Monte Carlo _sweep_ consists of perturbing all 
+the vertices of a given mesh
+
+(b) Molecular dynamics step: The ThermalizationProblem endows the mesh with a Maxwell-Boltzmann
+distriuted velocity field, which can be used by the Thermalizer to perform Langevin dynamics,
+treating the mesh vertices as particles.
+
+Sources: Statistical Mechanics of Membranes and Surfaces, edited by Nelson, Piran and Weinberg
+Partly inspired by: TriMem: A parallelized hybrid Monte Carlo software for 
+efficient simulations of lipid membranes, https://doi.org/10.1063/5.0101118
+*/
+import optimize 
+import vtk 
+import implicitmesh 
+
+/* ##################################################### */
+// Essential Classes and methods
+/* ##################################################### */
+
+// Define a class to export XYZ files from a mesh
+class XYZExporter {
+    init(filename, box_width) {
+        // Open file for writing
+        self.f = File(filename, "write")
+        var l = box_width
+        self.lattice = "Lattice=\"${l} 0.0 0.0 0.0 ${l} 0.0 0.0 0.0 ${l}\""
+        self.origin = "Origin=\"${-l/2} ${-l/2} ${-l/2}\""
+        self.pbc = "pbc=\"T T T\""
+    }
+
+    _preamble(mesh, time) {
+
+        self.f.write("${mesh.count()}") 
+        // file.write("Particles ") // This line can be anything the user wants.
+        self.f.write("Time=${time} ${self.lattice} ${self.origin} ${self.pbc}")
+    }
+
+    // Writes a vector to the file 
+    _writevector(v) {
+        if (v.count()==2) {
+            self.f.write("C ${v[0]} ${v[1]} 0 ")
+        }
+        else {
+            self.f.write("C ${v[0]} ${v[1]} ${v[2]} ")
+        }
+    }
+
+    // Writes all the vertices to the file
+    _writevertices(mesh) {
+        self.nvertices = mesh.count(0)
+
+        for (id in 0...mesh.count()) {
+            var v = mesh.vertexposition(id)
+            // self._writevector(mesh.vertexposition(id))]
+            if (id==0) self.f.write("C0 ${v[0]} ${v[1]} ${v[2]} ")
+            else self.f.write("C ${v[0]} ${v[1]} ${v[2]} ")
+            // self.f.write("C${id} ${v[0]} ${v[1]} ${v[2]} ")
+        }
+
+    }
+
+    // Function to export the mesh to a file with the name `filename`. 
+    // This name has to include the ".xyz" extension
+    addFrame(mesh, time) {
+        
+        // Ensure filename ends with ".vtk"
+        // self.filename = super._ensurevtk(filename)
+        // Add the preamble
+        self._preamble(mesh, time)
+
+        // Add the mesh
+        self._writevertices(mesh)
+    }
+
+    close() { 
+        // Close the file
+        self.f.close()
+
+    }
+}
+
+// A function similar to equiangulate, but one that flips 
+// edges of user's choice.
+fn flipSelected(m, sel, quiet=false) {
+    var vert = m.vertexmatrix()
+    var edges = m.connectivitymatrix(0,1)
+    var faces = m.connectivitymatrix(0,2)
+    var edgetoface = m.connectivitymatrix(2,1)
+    var verttoedge = m.connectivitymatrix(1,0)
+    var ne = edges.dimensions()[1]
+    var nflip = 0
+
+    for (iedge in sel) {
+        var ev=edges.rowindices(iedge) // vertices for this edge
+
+        var ef=edgetoface.rowindices(iedge) // faces attached to this edge
+
+        var cv=_cvert(ev, faces, ef)
+        _edgeflip(m, iedge, edges, faces, ev, cv, ef)
+        edgetoface = m.connectivitymatrix(2,1) // Recalculate connectivity
+        verttoedge = m.connectivitymatrix(1,0) // Recalculate connectivity
+        nflip+=1
+    }
+
+    if (!quiet) print "Equiangulate: ${nflip} edges flipped."
+
+    return nil
+}
+
+
+/* ###################################################### */
+// The main ThermalizationProblem and Thermalizer Classes
+/* ###################################################### */
+
+
+/*
+Defines the thermalization problem.
+Inputs:
+ * m - Mesh
+ * T - Temperature
+ * NDIMS - Number of dimensions the vertices are allowed to move in.
+*/
+class ThermalizationProblem is OptimizationProblem {
+
+    /* At initialization, we endow the mesh with a Maxwell-Boltzmann
+    distributed velocities with zero mean.
+    */
+    init(m, T, NDMIS) {
+        self.mesh = m
+        self.temp = T // Temperature
+        self.NDIMS = NDMIS // Number of dimensions for the motion
+        self.fields = []
+        self.energies = []
+        self.constraints = []
+        self.localconstraints = []
+        self.fixed = nil
+
+        // Initialize the velocities according to a Maxwell Boltzmann distribution
+        self.maxwellBoltzmann(self.temp)
+        self.subtractMean()
+        self.rescaleVelocities()
+    
+    }
+
+    /* This method generates a Maxwell-Boltzmann distribution of velocites in 3D/2D
+    for a given temperature (scale) 
+    */
+    maxwellBoltzmann(scale) {
+        var mb
+        if (self.NDIMS==3) {
+            mb = Field(self.mesh, fn(x,y,z) scale * Matrix([randomnormal(), randomnormal(), randomnormal()]))
+        } else if (self.NDIMS==2) {
+            mb = Field(self.mesh, fn(x,y,z) scale * Matrix([randomnormal(), randomnormal(), 0]))
+        }
+        self.v = mb.linearize()
+        self.v.reshape(3, self.mesh.count())
+
+    }
+    /* This method rescales the velocities of the particles globally in order to 
+    reset the temperature. This is the "thermostat" that our Langevin Equation will use
+    for a Canonicle Ensemble simulation.
+    */
+    rescaleVelocities() {
+
+        self.mean_kinetic_energy = 0.5 * self.v.norm()^2 / self.mesh.count()
+        self.thermal_energy = 0.5 * self.NDIMS * self.temp
+        var scale = sqrt(self.thermal_energy / self.mean_kinetic_energy)
+        self.v =  scale * self.v
+
+    }
+    /* This helper method subtracts the mean velocity from all the velocities to 
+    avoid global translation of the particles
+    */
+    subtractMean() {
+        var vmean = Matrix([0,0,0])
+        var Np = self.mesh.count()
+        for (i in 0...Np) {
+            vmean += self.v.column(i)
+        }
+        vmean /= Np
+        for (i in 0...Np) {
+            self.v.setcolumn(i, self.v.column(i)-vmean)
+        }
+    }
+
+    /* This method computes the current temperature of the system.
+    */
+    currentTemperature() {
+        var kinetic_energy = 0.5 * self.v.norm()^2
+        var temperature = 2 * kinetic_energy / (self.mesh.count() * self.NDIMS)
+        return temperature
+    }
+
+}
+
+/*
+Defines the Shape Thermalizer.
+Inputs:
+ * problem - The corresponding ThermalizationProblem object
+ * target - The mesh we wish to thermalize
+*/
+
+class Thermalizer is ShapeOptimizer {
+    /* At initialization, we compute the total energy of the system, treating
+    global constraints as weakly enforced with an energy prefactor*(c/c0 - 1)^2.
+    */
+    init(problem, target) {
+        self.problem = problem
+        self.target = target
+        self.fixed = nil
+        self.stepsize = 0.1
+        self.dt = 0.01
+        self.steplimit = 0.5
+        self.energy = [] // History of energies
+        self.etol = 1e-8 // Energy convergence criterion
+        self.ctol = 1e-10 // Constraint satisfaction criterion
+        self.linmintol = 0.001 // Convergence tolerance for line minimizations
+        self.linminmax = 10 // Maximum number of iterations for line minimizations
+        self.maxconstraintsteps = 20 // Maximum number of constraint steps
+        self.maxbracketsteps = 20 // Maximum number of bracketing steps 
+        self.quiet = false // Whether to report
+        self.Np = problem.mesh.count()
+        self.NDIMS = problem.NDIMS
+        self.L = problem.L
+        self.velocity_scale_steps = 100 // Interval of steps to pass by before checking for velocity rescaling
+        self.forces = self.totalforcewithconstraints()
+        var sel = self.getRegion(0, depth=1)
+        // self.currentEnergy = self.totalenergywithLagrange(sel=sel)
+        self.currentEnergy = self.totalenergywithLagrange()
+    }
+
+    /**********************************/
+    /* Methods for molecular dynamics */
+    /**********************************/
+
+    // Returns the velocity vector of the mesh
+    velocity() {
+        return self.problem.v
+    }
+
+    // Updates the velocity vector of the mesh with the provided value
+    updateVelocity(v) {
+        var err = Error("InvalidArgs", "The input for the `updateVelocity` method must be a Matrix of dimensions matching that of the vertex matrix of the mesh ([3,Nvertices])")
+        if (!ismatrix(v)) err.throw()
+        var dims = v.dimensions()
+        if (dims[0]!=3 || dims[1]!=self.Np) err.throw()
+        self.problem.v = v
+    }
+
+    /* Returns a bool indicating whether the current temperature has diverged away from the 
+     set temperature by more than a small percentage
+     Inputs:
+      * frac (optional) - The percentage beyond which the temperature is assumed to diverge
+    */
+    divergingTemperature(frac=0.15) {
+        var T0 = self.problem.temp 
+        var Ti = self.problem.currentTemperature()
+
+        return abs(Ti-T0) / T0 > frac
+    }
+
+    /* Take a timestep with the current velocities and interparticle forces.
+       The temperature is maintained by a velocity rescaling algorithm
+       Inputs:
+      * dt - step in time to take.
+        step - iteration number (this is used to execute the velocity rescaling).
+               every self.velocity_scale_steps number of steps, the velocities are 
+               rescaled if the temperature has diverged from the target.
+     */
+    timestep(dt, step, returnDisp=false) {
+        var half_dt2 = 0.5 * dt * dt 
+        var target = self.gettarget() // This returns self.problem.mesh.vertexmatrix()
+        if (!self.forces) return
+        var v = self.velocity()
+        var disp = v * dt - self.forces * half_dt2 
+        self.fixgrad(disp)
+        if (returnDisp) return disp
+        target.acc(1, disp) // Take a step
+        var mt = target.clone()
+        mt.reshape(3*self.Np, 1)
+        for (i in 0...3*self.Np) {
+            if (mt[i]>self.L/2) {
+                mt[i] = mod(mt[i] + self.L/2, self.L) - self.L/2
+            } 
+            else if (mt[i]<-self.L/2) {
+                mt[i] = mod(mt[i] - self.L/2, self.L) + self.L/2
+            } 
+        }
+        
+        mt.reshape(3, self.Np)
+        self.settarget(mt)
+        self.initlocalconstraints()
+        self.reprojectlocalconstraints() // Reproject onto local constraints
+
+        self.reprojectconstraints() // Push back onto constraints
+
+        self.new_forces = self.totalforcewithconstraints()
+
+        // accelerations, assuming particle masses are equal to 1
+        var a1 = -self.forces
+        var a2 = -self.new_forces
+        
+        // update particle velocities
+        self.updateVelocity(v + 0.5 * (a1 + a2) * dt)
+
+        // rescale velocities if necessary
+        if (mod(step, self.velocity_scale_steps) == 0 && self.divergingTemperature()) {
+
+            self.problem.rescaleVelocities()
+        }
+
+        // store new force values, and then correct for periodic boundary conditions
+        self.forces = self.new_forces
+
+    }
+
+    /* Performs a molecular dynamics simulation with the specified energies, 
+      constraints and temperature.
+      Inputs:
+      * nsteps - Number of timesteps to take.
+      * filename (optional) - The name of the xyz file (without the extension) in which 
+            to save the trajectory ("out" by default) 
+    */
+    md(nsteps, filename="out") {
+
+        var xyz = XYZExporter("${filename}.xyz", self.L)
+        var i = 0
+        // VTKExporter(self.problem.mesh).export("${filename}_${i}.vtk")
+        xyz.addFrame(self.problem.mesh, 0.0)
+        for (step in 1..nsteps) {
+            self.timestep(self.dt, step)
+            if (mod(step, 10)==0) {
+                i = i + 1
+                xyz.addFrame(self.problem.mesh, step*self.dt)
+                // VTKExporter(self.problem.mesh).export("${filename}_${i}.vtk")
+                self.reportmd(step)
+            }
+        }
+        xyz.close()
+    }
+
+    /* Print information about the temperature, potential energy and kinetic energy.
+      Input:
+      iter: Iteration number.
+    */
+    reportmd(iter) {
+        
+        var v = self.velocity()
+        var kinetic_energy = 0.5 * v.norm()^2
+        var potential_energy = self.totalenergy()
+        var total_energy = potential_energy + kinetic_energy
+        var temperature = 2 * kinetic_energy / (self.Np * self.NDIMS)
+        if (!self.quiet) {
+            print("Iteration ${iter}: T: ${temperature}, PE: ${potential_energy}, KE: ${kinetic_energy} Total: ${total_energy}")
+        }
+    }
+
+    /***************************************/
+    /* Methods for Monte Carlo simulations */
+    /***************************************/
+
+    /* Returns the Boltzmann probability for accepting a Monte Carlo move that takes the
+     system from energy ei to ef. Kb (the Boltzmann constant) is assumed to be 1 
+     all throughout this code.
+    */
+    boltzmannProbability(ei, ef) {
+        var b = exp((ei-ef)/self.problem.temp)
+        return min(1, b)
+    }
+
+    /* This method perturbs the vertices by a random increment in the cube [-s,s]^3 
+     Inspired by Kroll & Gompper, Science, 1992
+     Inputs:
+     s : Size of the perturbation
+    */
+    perturb(s) { 
+        
+        var f 
+        if (self.NDIMS==3) {
+            f = Field(self.problem.mesh, fn(x,y,z) 2*s * Matrix([random()-0.5, random()-0.5, random()-0.5]))
+        }
+        else {
+            f = Field(self.problem.mesh, fn(x,y,z) 2*s * Matrix([random()-0.5, random()-0.5, 0]))
+        }
+        var disp = f.linearize()
+        disp.reshape(3, self.problem.mesh.count())
+        self.fixgrad(disp)
+        var target = self.gettarget()
+        target.acc(1, disp) // Take a step
+        self.perturbation = disp
+        
+    }
+
+    /* This method perturbs a single vertex (indexed by vid) by a random increment
+     in the cube [-s,s]^3 
+     Inspired by Kroll & Gompper, Science, 1992
+     Inputs:
+     s : Size of the perturbation
+     vid : Index of the vertex to be perturbed
+    */
+    perturbVertex(s, vid) { 
+        
+        var disp = Matrix(3, self.problem.mesh.count())
+        if (self.NDIMS==3) {
+            disp.setcolumn(vid, 2*s * Matrix([random()-0.5, random()-0.5, random()-0.5]))
+        }
+        else {
+            disp.setcolumn(vid, 2*s * Matrix([random()-0.5, random()-0.5, 0]))
+        }
+
+        var target = self.gettarget()
+
+        target.acc(1, disp) // Take a step
+        self.perturbation = disp
+        
+    }
+
+    /* Randomly flip a fraction of the edges
+     Inputs:
+     gamma : Fraction of the edges to flip
+    */
+    flipEdges(gamma) {
+
+        var nEdges = self.problem.mesh.count(1)
+        var sel = []
+        var nFlips = floor(gamma * nEdges)
+        for (i in 1..nFlips) sel.append(randomint(nEdges))
+        flipSelected(self.problem.mesh, sel, quiet=true)
+
+    }
+    // Return a Selection containing the star of the vertex vid
+    getStar(vid) {
+        var sel = Selection(self.problem.mesh)
+        sel[0, vid] = true
+        for (g in 1..self.problem.mesh.maxgrade()) {
+            var conn = self.problem.mesh.connectivitymatrix(g,0)
+            var eids = conn.rowindices(vid)
+            for (eid in eids) sel[g, eid] = true
+
+        }
+        sel.addgrade(0)
+        sel.addgrade(1)
+        sel.addgrade(2)
+        return sel
+    }
+
+    /* Return a Selection containing the star of the vertex vid with a given depth.
+     Inputs:
+     vid : Vertex id
+     depth (optional) Depth of the star (default is 1). The for depth>1, the stars
+     of the vertices in the star at a given depth are added to the selection recursively.
+    */
+    getRegion(vid, depth=1) {
+        var sel = Selection(self.problem.mesh)
+        // var sel = self.getStar(vid)
+        // if (depth==1) return sel
+        sel[0, vid] = true
+        // for (level in 2..depth) {
+        for (level in 1..depth) {
+            var vids = sel.idlistforgrade(0)
+            for (v in vids) sel = sel.union(self.getStar(v))
+        }
+        return sel
+    }
+    
+    /* Returns the total energy of the system, treating each global constraint `c` as
+     an energy K(c/c0-1)^2 with the Lagrange multiplier K provided by its prefactor and
+     c0 provided by its target. 
+    */
+    totalenergywithLagrange() {
+        var en = self.totalenergy()
+        for (cons in self.constraints()) {
+            var ci = self.total(cons) / cons.prefactor
+            var c0 = cons.target 
+            en += cons.prefactor * (ci/c0 - 1)^2
+        }
+        return en
+    }
+
+    /* Returns the contribution to the total energy from a given vertex vid.
+     Each global constraint `c` is treated as an energy K(c/c0-1)^2 with 
+     the Lagrange multiplier K provided by its prefactor and c0 provided by its target.
+     These energies are computed in total, and not from the single vertex. 
+     TO-DO: Compute global constraint energies pointwise too.
+    */
+    totalenergywithLagrangePointwise(vid) {
+        var sel = self.getRegion(vid, depth=1)
+        for (en in self.energies()) en.selection = sel
+        var en = self.totalenergy()
+        for (cons in self.constraints()) {
+            var ci = self.total(cons) / cons.prefactor
+            var c0 = cons.target 
+            en += cons.prefactor * (ci/c0 - 1)^2
+        }
+        return en
+    }
+
+    /* The single Monte Carlo sweep. Here we, with equal probability,
+     either perturb a single vertex or flip a single edge (this hasn't been 
+     implemented yet). Then, we accept 
+     or reject the move based on the Boltzmann criterion.
+     Inputs:
+     iter - Iteration number (used to report details of the MC step)
+     s (optional) - Magnitude of the perturbation (0.001 by default)
+     Returns:
+     successes: Number of successful MC steps (vertex perturbations).
+    */
+    monteCarloStep(iter, s=0.001) {
+        var successes = 0
+        var movablePts = Selection(self.problem.mesh, fn(x,y,z) true)
+
+        if (islist(self.fixed)) {
+            for (vid in self.fixed) movablePts[0, vid] = false 
+        }
+
+        // for (vid in 0...self.problem.mesh.count()) {
+        for (vid in movablePts.idlistforgrade(0)) {
+            self.v0 = self.problem.mesh.vertexposition(vid)
+            self.perturbVertex(s, vid)
+
+            // The presence of local constraints will necessarily make the MC sweep O(N^2).
+            // TO-DO: Figure out a O(N) way to do this.
+            self.initlocalconstraints()
+            self.reprojectlocalconstraints() // Reproject onto local constraints
+
+            self.candidateEnergy = self.totalenergywithLagrange()
+            // self.candidateEnergy = self.totalenergywithLagrangePointwise(vid)
+            if (random()>self.boltzmannProbability(self.currentEnergy,self.candidateEnergy)) {
+                // Don't accept the move
+                self.gettarget().acc(-1, self.perturbation) // Take a step
+            }
+            else {
+                self.currentEnergy = self.candidateEnergy
+                successes += 1
+            }
+        }
+        self.reportmc(iter, successes)
+        return successes
+
+        // This is a placeholder commented codde to do random edge-flips.
+
+        // if (random()>0.5) {
+        //     // Perturb the mesh
+        //     self.perturb(0.01)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // else {
+        //     self.flipEdges(0.1)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // if (random()<self.boltzmannProbability(currentEnergy,candidateEnergy)) {
+        //     // Don't accept the move
+        //     self.problem.mesh = currentMesh
+        // }
+
+    }
+
+    /* An alternate take on the single Monte Carlo sweep. 
+     The difference being that here we perturb all vertices at the same time.
+     This can create a very low probability of successes and can thus 
+     can be computationally worse. There are some methods (using "Hamiltonian" or 
+     "Hybrid" Monte Carlo schemes, where the perturbation is performed by doing a few 
+     molecular dynamics steps on the meshes after endowing them with a Maxwell-Boltzmann
+     distributed velocity.)
+     Inputs:
+     iter - Iteration number (used to report details of the MC step)
+     s (optional) - Magnitude of the perturbation (0.001 by default)
+     Returns:
+     success: A bool to indicate whether the step was successful
+    */
+    monteCarloStep2(iter, s=0.001) {
+        var success = false
+        
+        self.perturb(s)
+        self.initlocalconstraints()
+        self.reprojectlocalconstraints() // Reproject onto local constraints
+        self.candidateEnergy = self.totalenergywithLagrange()
+        if (random()>self.boltzmannProbability(self.currentEnergy,self.candidateEnergy)) {
+            // Don't accept the move
+            self.gettarget().acc(-1, self.perturbation) // Take a step
+        }
+        else {
+            self.currentEnergy = self.candidateEnergy
+            success = true
+        }
+        self.reportmc2(iter, success)
+        return success
+
+        // This is a placeholder commented codde to do random edge-flips.
+        
+        // if (random()>0.5) {
+        //     // Perturb the mesh
+        //     self.perturb(0.01)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // else {
+        //     self.flipEdges(0.1)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // if (random()<self.boltzmannProbability(currentEnergy,candidateEnergy)) {
+        //     // Don't accept the move
+        //     self.problem.mesh = currentMesh
+        // }
+
+    }
+
+    /* Prints information about the single vertex Monte Carlo sweep.
+     Inputs:
+     iter: Iteration number
+     ns: Number of successful vertex perturbations
+    */
+    reportmc(iter, ns) {
+        
+        if (!self.quiet) {
+            print ("MC step ${iter}: Total energy: ${self.currentEnergy}, MC success rate: ${ns/self.problem.mesh.count()}")
+        }
+    }
+
+    /* Prints information about the all vertex Monte Carlo sweep.
+     Inputs:
+     iter: Iteration number
+     success: Bool to indicate whether the sweep was successful
+    */
+    reportmc2(iter, success) {
+        var result = "failed"
+        if (success) result = "succeeded"
+        if (!self.quiet) {
+            print ("MC step ${iter}: Total energy: ${self.currentEnergy}, MC step ${result}.")
+        }
+    }
+
+}
