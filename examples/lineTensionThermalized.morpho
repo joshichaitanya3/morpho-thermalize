@@ -1,0 +1,47 @@
+import meshtools
+import plot
+import thermalize
+
+// Define the initial ring. 
+
+var N = 50 // Number of vertices in the ring (+- 1)
+var mesh = LineMesh(fn(t) [cos(t), sin(t), 0], -Pi...Pi:2*Pi/N, closed=true)
+mesh.addgrade(1)
+mesh = ChangeMeshDimension(mesh, 3)
+
+// Get average length of a bond. 
+// This can be used to set the size of random perturbations.
+var lens = Length().integrand(mesh)
+var l0 = lens.sum()/lens.count()
+print "l0 = ${l0}"
+
+var ref_temp = 1 // Reference temperature, although we will assume KbT=1 everywhere for now
+var sigma = 1000.0 // Line tension, in units of KbT
+
+var tproblem = ThermalizationProblem(mesh, ref_temp, 2) // 2 is the number of spatial dimensions our system is in.
+
+tproblem.L = 100 // This would be used for periodic BCs later, but right now, just setting to a large number.
+tproblem.addenergy(Length(), prefactor=sigma)
+var cons = tproblem.addconstraint(AreaEnclosed())
+cons.prefactor = 10^6
+// Set up the thermalizer to for this problem.
+var thermalizer = Thermalizer(tproblem, mesh)
+thermalizer.quiet = true
+// print thermalizer.totalenergywithLagrange()
+var step = 0
+var nsteps = 100000
+var successesMatrix = Matrix(nsteps)
+var nsuccesses = 0
+system("mkdir data")
+for (i in 0...nsteps) {
+    nsuccesses = thermalizer.monteCarloStep(i, s=l0/10) // This step size s has chosen such that the fraction of successful step (see end of file) is ~0.5
+    successesMatrix[i] = nsuccesses
+    if (mod(i,100)==0) {
+        VTKExporter(mesh).export("data/Loop_${step}.vtk")
+        step += 1
+    }
+}
+
+print "Fraction of steps successful: ${successesMatrix.sum()/successesMatrix.count()/mesh.count()}"
+
+
