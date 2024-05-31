@@ -1,0 +1,16 @@
+import vtk 
+
+var n = 1000
+var area = AreaEnclosed()
+for (i in 0...n) {
+    var f = File("data/radii_${i}.txt", "write")
+    var m = VTKImporter("data/Loop_${i}.vtk").mesh()
+    var np = m.count()
+    var com = Matrix([0,0,0])
+    for (i in 0...np) com += m.vertexposition(i) / np
+    print area.total(m)
+    for (j in 0...np) {
+        f.write("${j} ${(m.vertexposition(j)-com).norm()}")
+    }
+    f.close()
+}
