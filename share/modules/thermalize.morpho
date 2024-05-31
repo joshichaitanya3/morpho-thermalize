@@ -23,6 +23,7 @@ efficient simulations of lipid membranes, https://doi.org/10.1063/5.0101118
 import optimize 
 import vtk 
 import implicitmesh 
+import meshtools 
 
 /* ##################################################### */
 // Essential Classes and methods
@@ -88,6 +89,24 @@ class XYZExporter {
         self.f.close()
 
     }
+}
+/* Finds vertices in a pair of triangles not in a common edge
+   @param[in] ev - list of two vertex ids
+   @param[in] faces - faces definition matrix
+   @param[in] ef - ids of two adjacent faces
+   @returns a list of vertices present in triangles ef but not part of ev */
+fn _cvert(ev, faces, ef) {
+  var cv = []
+  for (i in 0..1) for (v in faces.rowindices(ef[i])) if (!ev.ismember(v)) cv.append(v)
+  return cv
+}
+
+/* Flip the edge */
+fn _edgeflip(m, iedge, edges, faces, ev, cv, ef) {
+  edges.setrowindices(iedge, cv)
+  faces.setrowindices(ef[0], [ev[0], cv[0], cv[1]])
+  faces.setrowindices(ef[1], [ev[1], cv[0], cv[1]])
+  m.resetconnectivity()
 }
 
 // A function similar to equiangulate, but one that flips 
@@ -236,8 +255,22 @@ class Thermalizer is ShapeOptimizer {
         self.velocity_scale_steps = 100 // Interval of steps to pass by before checking for velocity rescaling
         self.forces = self.totalforcewithconstraints()
         // var sel = self.getRegion(0, depth=1)
-        // self.currentEnergy = self.totalenergywithLagrange(sel=sel)
-        self.currentEnergy = self.totalenergywithLagrange()
+        // self.currentEnergy = self.totalenergywithLagrangePointwise(sel=sel)
+        // self.currentEnergy = self.totalenergywithLagrange()
+        self.currentEnergy = self.totalenergy()
+        self.consTotals = []
+        for (cons in self.constraints()) {
+            self.consTotals.append(self.total(cons) / cons.prefactor)
+        }
+        self.sel = Selection(self.problem.mesh)
+        self.conn10 = self.problem.mesh.connectivitymatrix(1,0)
+        self.conn01 = self.problem.mesh.connectivitymatrix(0,1)
+        self.generateNeighborhood()
+        
+        self.eAtVs = Matrix(self.energies().count())
+        self.eAtVdVs = Matrix(self.energies().count())
+        self.cAtVs = Matrix(self.constraints().count())
+        self.cAtVdVs = Matrix(self.constraints().count())
     }
 
     /**********************************/
@@ -370,6 +403,23 @@ class Thermalizer is ShapeOptimizer {
     /* Methods for Monte Carlo simulations */
     /***************************************/
 
+    /* Generates a look-up table to get a list of vertices (self included) that are 
+     connected to a given vertex.
+    */
+    generateNeighborhood() {
+        var dict = Dictionary()
+        var eids 
+        self.neighborhood = []
+        for (vid in 0...self.problem.mesh.count()) {
+            dict[vid] = true
+            eids = self.conn10.rowindices(vid)
+            for (eid in eids) {
+                for (v in self.conn01.rowindices(eid)) dict[v] = true
+            }
+            self.neighborhood.append(dict.keys())
+            dict.clear()
+        }
+    }
     /* Returns the Boltzmann probability for accepting a Monte Carlo move that takes the
      system from energy ei to ef. Kb (the Boltzmann constant) is assumed to be 1 
      all throughout this code.
@@ -441,18 +491,21 @@ class Thermalizer is ShapeOptimizer {
     }
     // Return a Selection containing the star of the vertex vid
     getStar(vid) {
-        var sel = Selection(self.problem.mesh)
-        sel[0, vid] = true
+        // Clear the selection first
+        for (g in 0...self.problem.mesh.maxgrade()) self.sel.removegrade(g)
+        // var sel = Selection(self.problem.mesh)
+        self.sel[0, vid] = true
         for (g in 1..self.problem.mesh.maxgrade()) {
             var conn = self.problem.mesh.connectivitymatrix(g,0)
             var eids = conn.rowindices(vid)
-            for (eid in eids) sel[g, eid] = true
+            for (eid in eids) self.sel[g, eid] = true
 
         }
-        sel.addgrade(0)
-        sel.addgrade(1)
-        sel.addgrade(2)
-        return sel
+        // sel.addgrade(0)
+        // sel.addgrade(1)
+        // sel.addgrade(2)
+        // return sel
+        // return 
     }
 
     /* Return a Selection containing the star of the vertex vid with a given depth.
@@ -462,10 +515,10 @@ class Thermalizer is ShapeOptimizer {
      of the vertices in the star at a given depth are added to the selection recursively.
     */
     getRegion(vid, depth=1) {
-        var sel = Selection(self.problem.mesh)
-        // var sel = self.getStar(vid)
-        // if (depth==1) return sel
-        sel[0, vid] = true
+        // var sel = Selection(self.problem.mesh)
+        var sel = self.getStar(vid)
+        if (depth==1) return sel
+        // sel[0, vid] = true
         // for (level in 2..depth) {
         for (level in 1..depth) {
             var vids = sel.idlistforgrade(0)
@@ -474,6 +527,69 @@ class Thermalizer is ShapeOptimizer {
         return sel
     }
     
+    /* Returns the total value of a functional at a given selection. 
+     Slightly modified from Optimizer's `total` method. If the functional 
+     has a predefined selection, then we will compute the energy at the 
+     intersection of that and the input selection.
+     Aimed at computing energies from elements belonging to a single vertex, 
+     useful for MC sweeps. It will be used similar to how `total` is used in Optimizer.
+     Inputs:
+     func: The functional
+     sel: Selection on which to compute the energy. 
+    */
+    totalAtSel(func, sel) {
+        var prefactor = 1
+        if (func.prefactor) prefactor = func.prefactor
+        if (func.selection) {
+            return prefactor*func.functional.total(self.problem.mesh, func.selection.intersection(sel))
+        } 
+        else {
+            return prefactor*func.functional.total(self.problem.mesh, sel)
+        }
+    }
+
+    /* Returns the total value of a functional at a given selection. 
+     Slightly modified from Optimizer's `total` method. If the functional 
+     has a predefined selection, then we will compute the energy at the 
+     intersection of that and the input selection.
+     Aimed at computing energies from elements belonging to a single vertex, 
+     useful for MC sweeps. It will be used similar to how `total` is used in Optimizer.
+     Inputs:
+     func: The functional
+     sel: Selection on which to compute the energy. 
+    */
+    totalAt(func, vid) {
+        var prefactor = 1
+        var eids = self.conn10.rowindices(vid)
+        var total = 0.0
+        if (func.prefactor) prefactor = func.prefactor
+        if (func.selection) {
+            if (func.functional.grade==0) {
+                for (v in self.neighborhood[vid]) {
+                    if (func.selection.isselected(0, v)) total += prefactor*func.functional.integrandForElement(self.problem.mesh, v)
+                }
+            }
+            else if (func.functional.grade==1) {
+                for (eid in eids) {
+                    if (func.selection.isselected(1, eid)) total += prefactor*func.functional.integrandForElement(self.problem.mesh, eid)
+                }
+            }
+        }
+        else {
+            if (func.functional.grade==0) {
+                for (v in self.neighborhood[vid]) {
+                    total += prefactor*func.functional.integrandForElement(self.problem.mesh, v)
+                }
+            }
+            else {
+                for (eid in eids) {
+                    total += prefactor*func.functional.integrandForElement(self.problem.mesh, eid)
+                }
+            }
+        }
+        return total
+    }
+
     /* Returns the total energy of the system, treating each global constraint `c` as
      an energy K(c/c0-1)^2 with the Lagrange multiplier K provided by its prefactor and
      c0 provided by its target. 
@@ -489,23 +605,51 @@ class Thermalizer is ShapeOptimizer {
     }
 
     /* Returns the contribution to the total energy from a given vertex vid.
+     We define H_@(v) = \sum_{el s.t. v \in el} H.integrand(el) 
+     Practically, this boils down to computing the total energy on the star of the vertex
+     (unless there are energies that depend on higher order than a star)
+
      Each global constraint `c` is treated as an energy K(c/c0-1)^2 with 
      the Lagrange multiplier K provided by its prefactor and c0 provided by its target.
      These energies are computed in total, and not from the single vertex. 
      TO-DO: Compute global constraint energies pointwise too.
     */
-    totalenergywithLagrangePointwise(vid) {
-        var sel = self.getRegion(vid, depth=1)
-        for (en in self.energies()) en.selection = sel
-        var en = self.totalenergy()
-        for (cons in self.constraints()) {
-            var ci = self.total(cons) / cons.prefactor
-            var c0 = cons.target 
-            en += cons.prefactor * (ci/c0 - 1)^2
+    elementwiseEnergiesAndConstraints(vid, eAtVs, cAtVs) {
+        // var sel = self.getRegion(vid, depth=1)
+        // self.getStar(vid)
+        // var eAtVs = [] // Energy 
+        for (en,i in self.energies()) {
+            // eAtVs.append(self.totalAtSel(en, self.sel))
+            // eAtVs.append(self.totalAt(en, vid))
+            eAtVs[i] = self.totalAt(en, vid)
         }
-        return en
+        // var cAtVs = []
+        for (cons,i in self.constraints()) {
+            // cAtVs.append(self.totalAtSel(cons, self.sel) / cons.prefactor)
+            // cAtVs.append(self.totalAt(cons, vid) / cons.prefactor)
+            cAtVs[i] = self.totalAt(cons, vid) / cons.prefactor
+        }
+        // return [eAtVs, cAtVs]
     }
 
+    /*
+
+    DeltaC = ((ct+cvdv-cv)/c0 -1)^2 - (ct/c0-1)^2
+           = ((2*ct+cdv)/c0 -2)(cdv/c0) 
+    */
+    computeDeltaE(ev, cv, evdv, cvdv) {
+        self.deltaE = 0 
+        for (i in 0...ev.count()) {
+            self.deltaE += evdv[i] - ev[i]
+        }
+        for (cons,i in self.constraints()) {
+            var ct = self.consTotals[i] // Total before
+            var cdv = cvdv[i] - cv[i] // Contribution excluding the vertex 
+            var c0 = cons.target 
+            self.deltaE += cons.prefactor * ((2*ct+cdv)/c0 - 2) * (cdv/c0)
+        }
+
+    }
     /* The single Monte Carlo sweep. Here we, with equal probability,
      either perturb a single vertex or flip a single edge (this hasn't been 
      implemented yet). Then, we accept 
@@ -615,6 +759,82 @@ class Thermalizer is ShapeOptimizer {
 
     }
 
+    monteCarloSweep(iter, s=0.001) {
+
+        var successes = 0
+        var movablePts = Selection(self.problem.mesh, fn(x,y,z) true)
+
+        if (islist(self.fixed)) {
+            for (vid in self.fixed) movablePts[0, vid] = false 
+        }
+
+        // Get initial values of constraints
+        self.consTotals = []
+        for (cons in self.constraints()) {
+            self.consTotals.append(self.total(cons) / cons.prefactor)
+        }
+        // var eAtVs, cAtVs, out, eAtVdVs, cAtVdVs
+        var out
+        // for (vid in 0...self.problem.mesh.count()) {
+        for (vid in movablePts.idlistforgrade(0)) {
+
+            // Get initial E_@(v) and C_@(v)
+            // out = self.elementwiseEnergiesAndConstraints(vid)
+            // eAtVs = out[0]
+            // cAtVs = out[1]
+            self.elementwiseEnergiesAndConstraints(vid, self.eAtVs, self.cAtVs)
+
+            self.perturbVertex(s, vid)
+            // out = self.elementwiseEnergiesAndConstraints(vid)
+            // eAtVdVs = out[0]
+            // cAtVdVs = out[1]
+            self.elementwiseEnergiesAndConstraints(vid, self.eAtVdVs, self.cAtVdVs)
+            
+            self.computeDeltaE(self.eAtVs, self.cAtVs, self.eAtVdVs, self.cAtVdVs)
+            // The presence of local constraints will necessarily make the MC sweep O(N^2).
+            // TO-DO: Figure out a O(N) way to do this.
+            self.initlocalconstraints()
+            self.reprojectlocalconstraints() // Reproject onto local constraints
+
+            // self.candidateEnergy = self.totalenergywithLagrange()
+            // self.candidateEnergy = self.totalenergywithLagrangePointwise(vid)
+            if (random()>self.boltzmannProbability(0,self.deltaE)) {
+                // Don't accept the move
+                self.gettarget().acc(-1, self.perturbation) // Take a step
+            }
+            else {
+                // Move is accepted. Update the energy consTotal values
+                for (ei in 0...self.eAtVs.count()) {
+                    self.currentEnergy += (self.eAtVdVs[ei] - self.eAtVs[ei])
+                }
+                for (ci in 0...self.consTotals.count()) {
+                    self.consTotals[ci] += self.cAtVdVs[ci] - self.cAtVs[ci]
+                }
+                successes += 1
+            }
+        }
+        self.reportmc(iter, successes)
+        return successes
+
+        // This is a placeholder commented codde to do random edge-flips.
+
+        // if (random()>0.5) {
+        //     // Perturb the mesh
+        //     self.perturb(0.01)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // else {
+        //     self.flipEdges(0.1)
+        //     candidateEnergy = self.totalenergy()
+        // }
+        // if (random()<self.boltzmannProbability(currentEnergy,candidateEnergy)) {
+        //     // Don't accept the move
+        //     self.problem.mesh = currentMesh
+        // }
+
+        
+    }
+
     /* Prints information about the single vertex Monte Carlo sweep.
      Inputs:
      iter: Iteration number
@@ -623,7 +843,7 @@ class Thermalizer is ShapeOptimizer {
     reportmc(iter, ns) {
         
         if (!self.quiet) {
-            print ("MC step ${iter}: Total energy: ${self.currentEnergy}, MC success rate: ${ns/self.problem.mesh.count()}")
+            print ("MC step ${iter}: Total energy: ${self.totalenergy()}, MC success rate: ${ns/self.problem.mesh.count()}")
         }
     }
 
